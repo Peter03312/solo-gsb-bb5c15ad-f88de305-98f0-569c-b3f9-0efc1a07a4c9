@@ -55,6 +55,16 @@ import {
   planReadingSpeedFix,
   readingChars
 } from '../src/lib/readingSpeed';
+import {
+  analyzeActivityGaps,
+  DEFAULT_GAP_MERGE_GAP,
+  DEFAULT_GAP_MIN_DURATION,
+  DEFAULT_GAP_TOLERANCE,
+  detectActivity,
+  mergeCueIntervals,
+  mergeIntervals,
+  subtractIntervals
+} from '../src/lib/activityGaps';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -864,6 +874,124 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
   h4 = redoHistory(h4);
   assert(h4.present[1].end === 2.75, '重做恢复');
   assert(serializeSrt(h4.present).includes('00:00:01,750 --> 00:00:02,750'), '修复结果可由现有 SRT 导出');
+}
+
+/* ---------------- 音频活动空档：活动段提取 / 字幕合并扣除 / 下限过滤 ---------------- */
+
+// 31. 活动段提取：高能量连续窗口成段，阈值边界与静音互补（恰好等于算活动）
+{
+  const sr = 1000;
+  const ch = new Float32Array(sr);
+  ch.fill(0.5, 0, 300); // 0~0.3s 有声
+  ch.fill(0.5, 600, 1000); // 0.6~1.0s 有声（中间 0.3s 静音）
+  const win = computeWindowLevels([ch], sr);
+  const segs = detectActivity(win, 0.01, 0);
+  assert(segs.length === 2, `断口不合并时 2 段活动（实际 ${segs.length}）`);
+  assert(segs[0].start === 0 && segs[0].end === 0.3, `首段 0~0.3（实际 ${segs[0].start}~${segs[0].end}）`);
+  assert(segs[1].start === 0.6 && segs[1].end === 1, `次段 0.6~1.0（实际 ${segs[1].start}~${segs[1].end}）`);
+  // RMS 恰好等于阈值：静音判定的互补侧，视为活动
+  const eq = computeWindowLevels([new Float32Array(sr).fill(0.01)], sr);
+  const eqSegs = detectActivity(eq, 0.01, 0);
+  assert(eqSegs.length === 1 && eqSegs[0].start === 0 && eqSegs[0].end === 1, 'RMS 等于阈值判为活动');
+  const quiet = computeWindowLevels([new Float32Array(sr).fill(0.009)], sr);
+  assert(detectActivity(quiet, 0.01, 0).length === 0, 'RMS 低于阈值无活动段');
+}
+
+// 32. 低能量断口合并：不足 mergeGap 合并，恰好等于不合并
+{
+  const sr = 1000;
+  const ch = new Float32Array(sr);
+  ch.fill(0.5, 0, 400); // 0~0.4s
+  ch.fill(0.5, 600, 1000); // 0.6~1.0s（断口 0.2s）
+  const win = computeWindowLevels([ch], sr);
+  const merged = detectActivity(win, 0.01, 0.3);
+  assert(merged.length === 1 && merged[0].start === 0 && merged[0].end === 1, `0.2s 断口被 0.3s 合并（实际 ${merged.length} 段）`);
+  const exact = detectActivity(win, 0.01, 0.2);
+  assert(exact.length === 2, '断口恰好等于 mergeGap 不合并');
+  const none = detectActivity(win, 0.01, 0);
+  assert(none.length === 2, 'mergeGap 为 0 不合并');
+}
+
+// 33. 字幕区间合并：重叠与首尾相接并为一段，互不重叠保持分离
+{
+  const merged = mergeCueIntervals([
+    { id: 'a', start: 1, end: 2, text: 'a' },
+    { id: 'b', start: 1.5, end: 3, text: 'b' }, // 与 a 重叠
+    { id: 'c', start: 3, end: 4, text: 'c' }, // 与 b 首尾相接
+    { id: 'd', start: 5, end: 6, text: 'd' }
+  ]);
+  assert(merged.length === 2, `合并为 2 段（实际 ${merged.length}）`);
+  assert(merged[0].start === 1 && merged[0].end === 4, `重叠+相接并成 1~4（实际 ${merged[0].start}~${merged[0].end}）`);
+  assert(merged[1].start === 5 && merged[1].end === 6, '不相交段保持独立');
+  // mergeIntervals 对无序输入先排序
+  const sorted = mergeIntervals([
+    { start: 5, end: 6 },
+    { start: 0, end: 1 }
+  ]);
+  assert(sorted[0].start === 0 && sorted[1].start === 5, '合并前按起点排序');
+}
+
+// 34. 区间扣除：覆盖段从活动段中挖去，恰好相接不切割
+{
+  const rest = subtractIntervals(
+    [{ start: 0, end: 10 }],
+    [
+      { start: 2, end: 4 },
+      { start: 6, end: 8 }
+    ]
+  );
+  assert(rest.length === 3, `扣除后 3 段（实际 ${rest.length}）`);
+  assert(rest[0].start === 0 && rest[0].end === 2, '余段 0~2');
+  assert(rest[1].start === 4 && rest[1].end === 6, '余段 4~6');
+  assert(rest[2].start === 8 && rest[2].end === 10, '余段 8~10');
+  // 覆盖端点与活动端点恰好相接：不产生零长碎片
+  const touch = subtractIntervals([{ start: 0, end: 2 }], [{ start: 2, end: 5 }]);
+  assert(touch.length === 1 && touch[0].start === 0 && touch[0].end === 2, '恰好相接不切割');
+  // 全覆盖：无剩余
+  const gone = subtractIntervals([{ start: 1, end: 2 }], [{ start: 0, end: 3 }]);
+  assert(gone.length === 0, '全覆盖后无剩余');
+}
+
+// 35. 端到端：合并字幕 + 边界容差扣除 + 下限过滤（容差不越过 0s）
+{
+  const sr = 1000;
+  const ch = new Float32Array(2 * sr);
+  ch.fill(0.5, 0, sr); // 0~1.0s 有声，1.0~2.0s 静音
+  const win = computeWindowLevels([ch], sr);
+  const cues2 = [
+    { id: 'a', start: 0.2, end: 0.5, text: 'a' },
+    { id: 'b', start: 0.6, end: 0.7, text: 'b' }
+  ];
+  // 容差 0.1：a -> [0.1,0.6]，b -> [0.5,0.8]，再合并为 [0.1,0.8]
+  const r1 = analyzeActivityGaps(win, cues2, { threshold: 0.01, mergeGap: 0, tolerance: 0.1, minDuration: 0.1 });
+  assert(r1.activity.length === 1 && r1.activity[0].end === 1, '活动段 0~1.0');
+  assert(r1.covered.length === 1 && r1.covered[0].start === 0.1 && r1.covered[0].end === 0.8, `覆盖合并为 0.1~0.8（实际 ${r1.covered[0]?.start}~${r1.covered[0]?.end}）`);
+  assert(r1.gaps.length === 2, `两段空档（实际 ${r1.gaps.length}）`);
+  assert(r1.gaps[0].start === 0 && Math.abs(r1.gaps[0].end - 0.1) < 1e-9, '空档 0~0.1');
+  assert(Math.abs(r1.gaps[1].start - 0.8) < 1e-9 && r1.gaps[1].end === 1, '空档 0.8~1.0');
+  // 下限 0.2：0.8~1.0 段恰好 0.2s 仍列出，0~0.1 段被过滤
+  const r2 = analyzeActivityGaps(win, cues2, { threshold: 0.01, mergeGap: 0, tolerance: 0.1, minDuration: 0.2 });
+  assert(r2.gaps.length === 1 && Math.abs(r2.gaps[0].start - 0.8) < 1e-9, '恰好达到下限的空档仍列出');
+  // 容差把覆盖起点扩到 0 以下：按 0s 截断；扩展后整段活动被覆盖则无空档
+  const r3 = analyzeActivityGaps(win, cues2, { threshold: 0.01, mergeGap: 0, tolerance: 0.5, minDuration: 0.1 });
+  assert(r3.covered[0].start === 0, '容差扩展不越过 0s');
+  assert(r3.gaps.length === 0, '容差扩大后整段活动被覆盖，无空档');
+  // 重叠字幕不会重复切割：两条重叠字幕覆盖同一段，剩余只算一次
+  const overlap = analyzeActivityGaps(
+    win,
+    [
+      { id: 'a', start: 0.2, end: 0.6, text: 'a' },
+      { id: 'b', start: 0.4, end: 0.8, text: 'b' }
+    ],
+    { threshold: 0.01, mergeGap: 0, tolerance: 0, minDuration: 0.05 }
+  );
+  assert(overlap.covered.length === 1 && overlap.covered[0].end === 0.8, '重叠字幕先合并为一段覆盖');
+  assert(overlap.gaps.length === 2 && overlap.gaps[0].end === 0.2 && overlap.gaps[1].start === 0.8, '重叠覆盖只扣除一次');
+  // 无字幕：整个活动段即空档
+  const noCue = analyzeActivityGaps(win, [], { threshold: 0.01, mergeGap: 0, tolerance: 0.1, minDuration: 0.5 });
+  assert(noCue.gaps.length === 1 && noCue.gaps[0].start === 0 && noCue.gaps[0].end === 1, '无字幕时整段活动为空档');
+  // 默认参数合理
+  assert(DEFAULT_GAP_MERGE_GAP > 0 && DEFAULT_GAP_TOLERANCE >= 0 && DEFAULT_GAP_MIN_DURATION > 0, '空档默认参数为正');
 }
 
 process.exit(fail ? 1 : 0);
