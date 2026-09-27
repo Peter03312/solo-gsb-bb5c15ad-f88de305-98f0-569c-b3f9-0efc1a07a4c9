@@ -6,6 +6,15 @@ import ShadowPanel from './components/ShadowPanel';
 import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
 import SpeedPanel from './components/SpeedPanel';
+import GapPanel from './components/GapPanel';
+import {
+  computeActivityGaps,
+  DEFAULT_GAP_MERGE_BREAK,
+  DEFAULT_GAP_MIN_DURATION,
+  DEFAULT_GAP_THRESHOLD_DB,
+  DEFAULT_GAP_TOLERANCE,
+  type ActivityGap
+} from './lib/activityGaps';
 import {
   buildRefDiff,
   summarizeRefDiff,
@@ -81,6 +90,8 @@ const AUTOSAVE_KEY = 'subtitle-deck.autosave';
 const SAVE_DEBOUNCE_MS = 400;
 /** 未载入参考轨时传给面板的稳定空数组（避免每次渲染新建引用） */
 const NO_CUES: Cue[] = [];
+/** 音频分析未就绪时传给空档面板的稳定空数组 */
+const NO_GAPS: ActivityGap[] = [];
 
 function loadAutoSavePref(): boolean {
   try {
@@ -149,6 +160,13 @@ export default function App() {
   // 阅读速度修复：可调字/秒阈值与面板内选中条目（仅页面内存；切换 SRT 清空选择）
   const [speedThreshold, setSpeedThreshold] = useState(10);
   const [speedSelectedId, setSpeedSelectedId] = useState<string | null>(null);
+
+  // 音频活动空档审阅：电平阈值 / 断口合并 / 边界容差 / 最短空档四项参数
+  // 仅存在于当前页面内存（不进会话快照），随字幕、参数或音频变化实时重算
+  const [gapThresholdDb, setGapThresholdDb] = useState(DEFAULT_GAP_THRESHOLD_DB);
+  const [gapMergeBreak, setGapMergeBreak] = useState(DEFAULT_GAP_MERGE_BREAK);
+  const [gapTolerance, setGapTolerance] = useState(DEFAULT_GAP_TOLERANCE);
+  const [gapMinDuration, setGapMinDuration] = useState(DEFAULT_GAP_MIN_DURATION);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -397,6 +415,22 @@ export default function App() {
   const silenceSegments = useMemo(
     () => (levels ? detectSilences(levels, { threshold: silenceThreshold }) : []),
     [levels, silenceThreshold]
+  );
+
+  // 音频活动空档：复用同一份 20ms 窗口能量，字幕时间码 / 参数 / 音频变化后实时重算。
+  // levels 在切换音频（或导入新 SRT、恢复会话）时立即清空并重新分析，
+  // 派生结果随之失效，旧音频的空档不会残留
+  const activityGaps = useMemo(
+    () =>
+      levels
+        ? computeActivityGaps(levels, cues, {
+            threshold: dbToAmplitude(gapThresholdDb),
+            mergeBreak: gapMergeBreak,
+            tolerance: gapTolerance,
+            minDuration: gapMinDuration
+          })
+        : null,
+    [levels, cues, gapThresholdDb, gapMergeBreak, gapTolerance, gapMinDuration]
   );
 
   const seek = useCallback(
@@ -774,6 +808,17 @@ export default function App() {
       seek(cue.start);
     },
     [seek]
+  );
+
+  /**
+   * 点击空档条目：定位播放头到区间起点并播放试听。
+   * 纯定位操作——不修改字幕、不产生撤销历史。
+   */
+  const handleGapLocate = useCallback(
+    (gap: ActivityGap) => {
+      seekAndPlay(gap.start);
+    },
+    [seekAndPlay]
   );
 
   /* ---------------- 历史：快捷键 ---------------- */
@@ -1165,6 +1210,9 @@ export default function App() {
     if (speedOverEntries.length > 0) {
       parts.push(`阅读速度超限 ${speedOverEntries.length} 条（>${speedThreshold} 字/秒）`);
     }
+    if (activityGaps && activityGaps.gaps.length > 0) {
+      parts.push(`疑似未覆盖音频活动 ${activityGaps.gaps.length} 段`);
+    }
     if (audioPending) parts.push('等待重新选择音频（播放已停用，编辑/导出不受影响）');
     if (sessionId) {
       if (!autoSave) parts.push('自动保存已停用');
@@ -1193,7 +1241,8 @@ export default function App() {
     refTrack,
     refStats,
     speedOverEntries,
-    speedThreshold
+    speedThreshold,
+    activityGaps
   ]);
 
   return (
@@ -1345,6 +1394,22 @@ export default function App() {
             fix={speedFix}
             audioLoaded={hasAudio}
             onApply={applySpeedFix}
+          />
+          <GapPanel
+            status={silenceStatus}
+            error={silenceError}
+            audioPending={audioPending}
+            gaps={activityGaps?.gaps ?? NO_GAPS}
+            activityCount={activityGaps?.activity.length ?? 0}
+            thresholdDb={gapThresholdDb}
+            mergeBreak={gapMergeBreak}
+            tolerance={gapTolerance}
+            minDuration={gapMinDuration}
+            onThresholdDbChange={setGapThresholdDb}
+            onMergeBreakChange={setGapMergeBreak}
+            onToleranceChange={setGapTolerance}
+            onMinDurationChange={setGapMinDuration}
+            onLocate={handleGapLocate}
           />
         </section>
         <CueList

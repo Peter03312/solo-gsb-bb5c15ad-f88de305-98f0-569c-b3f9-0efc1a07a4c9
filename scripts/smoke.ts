@@ -55,6 +55,12 @@ import {
   planReadingSpeedFix,
   readingChars
 } from '../src/lib/readingSpeed';
+import {
+  computeActivityGaps,
+  detectActivitySegments,
+  mergeCueIntervals,
+  subtractCueIntervals
+} from '../src/lib/activityGaps';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -864,6 +870,154 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
   h4 = redoHistory(h4);
   assert(h4.present[1].end === 2.75, '重做恢复');
   assert(serializeSrt(h4.present).includes('00:00:01,750 --> 00:00:02,750'), '修复结果可由现有 SRT 导出');
+}
+
+/* ---------------- 音频活动空档审阅 ---------------- */
+
+// 31. 活动段提取：阈值互补判定与断口合并
+{
+  const sr = 1000;
+  const ch = new Float32Array(sr * 2);
+  ch.fill(0.5, 0, 1000); // 0~1.0s 有声
+  ch.fill(0, 1000, 1200); // 1.0~1.2s 低能量断口（200ms）
+  ch.fill(0.5, 1200, 2000); // 1.2~2.0s 有声
+  const win = computeWindowLevels([ch], sr);
+
+  const merged = detectActivitySegments(win, 0.01, 0.25);
+  assert(
+    merged.length === 1 && merged[0].start === 0 && merged[0].end === 2,
+    `断口 200ms < 250ms 合并为 0~2（实际 ${merged.length} 段）`
+  );
+  const exact = detectActivitySegments(win, 0.01, 0.2);
+  assert(exact.length === 2, '断口恰好等于合并上限不合并（严格小于才合并）');
+  assert(
+    exact[0].start === 0 && exact[0].end === 1 && exact[1].start === 1.2 && exact[1].end === 2,
+    `两段 0~1.0 与 1.2~2.0（实际 ${exact[0]?.start}~${exact[0]?.end} / ${exact[1]?.start}~${exact[1]?.end}）`
+  );
+  const wide = detectActivitySegments(win, 0.01, 0.15);
+  assert(wide.length === 2, '断口 200ms > 150ms 不合并');
+
+  // 与静音判定互补：能量恰好等于阈值算活动
+  const flat = computeWindowLevels([new Float32Array(sr).fill(0.01)], sr);
+  assert(detectActivitySegments(flat, 0.01, 0).length === 1, '能量恰好等于阈值算活动');
+  assert(detectActivitySegments(flat, 0.02, 0).length === 0, '能量低于阈值不算活动');
+  // 全静音音频：无活动段
+  const quiet = computeWindowLevels([new Float32Array(sr)], sr);
+  assert(detectActivitySegments(quiet, 0.01, 0.25).length === 0, '全静音无活动段');
+}
+
+// 32. 字幕区间合并、带容差扣除与最短时长过滤
+{
+  // 重叠与相接的字幕区间先合并为一个
+  const mergedCues = mergeCueIntervals([
+    { id: 'a', start: 0.3, end: 0.8, text: 'a' },
+    { id: 'b', start: 0.7, end: 1.1, text: 'b' },
+    { id: 'c', start: 1.1, end: 1.3, text: 'c' },
+    { id: 'd', start: 1.5, end: 1.6, text: 'd' }
+  ]);
+  assert(
+    mergedCues.length === 2 && mergedCues[0].start === 0.3 && mergedCues[0].end === 1.3,
+    `重叠/相接字幕合并为 0.3~1.3（实际 ${mergedCues.length} 段）`
+  );
+  assert(mergedCues[1].start === 1.5 && mergedCues[1].end === 1.6, '独立区间保持原样');
+
+  // 带边界容差扣除：[0.3,0.8] 容差 0.1 -> 扣除 [0.2,0.9]
+  const rest = subtractCueIntervals(
+    [{ start: 0, end: 1 }],
+    [{ id: 'a', start: 0.3, end: 0.8, text: 'a' }],
+    0.1
+  );
+  assert(
+    rest.length === 2 && Math.abs(rest[0].end - 0.2) < 1e-9 && Math.abs(rest[1].start - 0.9) < 1e-9,
+    '容差向两侧扩展后扣除'
+  );
+  // 容差把字幕起点夹到 0s（[0.05,0.5] 容差 0.1 -> 扣除 [0,0.6]）
+  const clamped = subtractCueIntervals(
+    [{ start: 0, end: 1 }],
+    [{ id: 'a', start: 0.05, end: 0.5, text: 'a' }],
+    0.1
+  );
+  assert(
+    clamped.length === 1 && Math.abs(clamped[0].start - 0.6) < 1e-9 && clamped[0].end === 1,
+    '容差扩展不越过 0s'
+  );
+  // 零容差精确扣除；端点相接不算交叠
+  const rest0 = subtractCueIntervals(
+    [{ start: 0, end: 2 }],
+    [{ id: 'a', start: 0.5, end: 1, text: 'a' }],
+    0
+  );
+  assert(rest0.length === 2 && rest0[0].end === 0.5 && rest0[1].start === 1, '零容差精确扣除');
+  const touching = subtractCueIntervals(
+    [{ start: 1, end: 2 }],
+    [{ id: 'a', start: 0.5, end: 1, text: 'a' }],
+    0
+  );
+  assert(touching.length === 1 && touching[0].start === 1 && touching[0].end === 2, '端点相接不切割');
+  // 重叠字幕先合并再扣除，不会因重复切割产生错误碎片
+  const overlap = subtractCueIntervals(
+    [{ start: 0, end: 2 }],
+    [
+      { id: 'a', start: 0.3, end: 0.8, text: 'a' },
+      { id: 'b', start: 0.7, end: 1.1, text: 'b' }
+    ],
+    0
+  );
+  assert(
+    overlap.length === 2 && overlap[0].end === 0.3 && overlap[1].start === 1.1,
+    '重叠字幕合并后一次性扣除'
+  );
+}
+
+// 33. 端到端：活动段 - 字幕（带容差）-> 按下限过滤；无字幕 / 全覆盖边界
+{
+  const sr = 1000;
+  const ch = new Float32Array(sr * 2);
+  ch.fill(0.5, 0, 1000);
+  ch.fill(0, 1000, 1200);
+  ch.fill(0.5, 1200, 2000);
+  const win = computeWindowLevels([ch], sr);
+
+  // 活动 0~1.0 与 1.2~2.0；字幕 [0.3,0.8] 容差 0.1 -> 剩余 [0,0.2] [0.9,1.0] [1.2,2.0]
+  const result = computeActivityGaps(win, [{ id: 'a', start: 0.3, end: 0.8, text: 'a' }], {
+    threshold: 0.01,
+    mergeBreak: 0.15,
+    tolerance: 0.1,
+    minDuration: 0.2
+  });
+  assert(result.activity.length === 2, '扣除前 2 段活动');
+  assert(result.gaps.length === 2, `0.2s 与 0.8s 达到下限、0.1s 被过滤（实际 ${result.gaps.length} 段）`);
+  assert(Math.abs(result.gaps[0].duration - 0.2) < 1e-6, '剩余恰好等于下限也列出');
+  assert(
+    Math.abs(result.gaps[1].start - 1.2) < 1e-9 && Math.abs(result.gaps[1].duration - 0.8) < 1e-6,
+    '第二段 1.2~2.0（0.8s）'
+  );
+
+  // 无字幕：全部活动段都是空档
+  const noCues = computeActivityGaps(win, [], {
+    threshold: 0.01,
+    mergeBreak: 0.15,
+    tolerance: 0.1,
+    minDuration: 0.5
+  });
+  assert(noCues.gaps.length === 2, '无字幕时活动段全部列为空档');
+
+  // 字幕加容差全覆盖：无空档
+  const covered = computeActivityGaps(win, [{ id: 'a', start: 0, end: 2, text: 'a' }], {
+    threshold: 0.01,
+    mergeBreak: 0.15,
+    tolerance: 0.1,
+    minDuration: 0.05
+  });
+  assert(covered.gaps.length === 0, '字幕加容差全覆盖时无空档');
+
+  // 调高阈值后弱信号不再算活动：空档随参数实时变化
+  const raised = computeActivityGaps(
+    computeWindowLevels([new Float32Array(sr).fill(0.005)], sr),
+    [],
+    { threshold: 0.01, mergeBreak: 0.25, tolerance: 0, minDuration: 0.5 }
+  );
+  assert(raised.activity.length === 0 && raised.gaps.length === 0, '弱信号低于阈值无活动段');
 }
 
 process.exit(fail ? 1 : 0);
